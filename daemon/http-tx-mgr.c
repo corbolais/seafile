@@ -169,6 +169,8 @@ static const char *http_task_rt_state_str[] = {
 static const char *http_task_error_strs[] = {
     "Successful",
     "Permission denied on server",
+    "Do not have write permission to the library",
+    "Do not have permission to sync the library",
     "Network error",
     "Cannot resolve proxy address",
     "Cannot resolve server address",
@@ -1095,30 +1097,51 @@ out:
 }
 
 static int
-http_error_to_http_task_error (int status)
+http_error_to_http_task_error (int status, char *rsp_content, gint64 rsp_size)
 {
+    json_t *rsp_obj = NULL;
+    const char *reason = NULL;
+    int ret;
+
     if (status == HTTP_BAD_REQUEST)
-        return HTTP_TASK_ERR_BAD_REQUEST;
-    else if (status == HTTP_FORBIDDEN)
-        return HTTP_TASK_ERR_FORBIDDEN;
-    else if (status >= HTTP_INTERNAL_SERVER_ERROR)
-        return HTTP_TASK_ERR_SERVER;
+        ret =  HTTP_TASK_ERR_BAD_REQUEST;
+    else if (status == HTTP_FORBIDDEN) {
+        if (rsp_content) {
+            rsp_obj = json_loadb (rsp_content, rsp_size, 0 ,NULL);
+            if ((reason = json_string_value (json_object_get (rsp_obj, "reason")))) {
+                if (strcmp (reason, "no write permission") == 0)
+                    ret = HTTP_TASK_ERR_NO_WRITE_PERMISSION;
+                else if (strcmp (reason, "no permission") == 0)
+                    ret = HTTP_TASK_ERR_NO_PERMISSION_TO_SYNC;
+                else
+                    ret = HTTP_TASK_ERR_FORBIDDEN;
+            } else
+                ret = HTTP_TASK_ERR_FORBIDDEN;
+        } else
+            ret = HTTP_TASK_ERR_FORBIDDEN;
+
+    } else if (status >= HTTP_INTERNAL_SERVER_ERROR)
+        ret = HTTP_TASK_ERR_SERVER;
     else if (status == HTTP_NOT_FOUND)
-        return HTTP_TASK_ERR_SERVER;
+        ret = HTTP_TASK_ERR_SERVER;
     else if (status == HTTP_NO_QUOTA)
-        return HTTP_TASK_ERR_NO_QUOTA;
+        ret = HTTP_TASK_ERR_NO_QUOTA;
     else if (status == HTTP_REPO_DELETED)
-        return HTTP_TASK_ERR_REPO_DELETED;
+        ret = HTTP_TASK_ERR_REPO_DELETED;
     else if (status == HTTP_REPO_CORRUPTED)
-        return HTTP_TASK_ERR_REPO_CORRUPTED;
+        ret = HTTP_TASK_ERR_REPO_CORRUPTED;
     else
-        return HTTP_TASK_ERR_UNKNOWN;
+        ret = HTTP_TASK_ERR_UNKNOWN;
+
+    if (rsp_obj)
+        json_decref (rsp_obj);
+    return ret;
 }
 
 static void
-handle_http_errors (HttpTxTask *task, int status)
+handle_http_errors (HttpTxTask *task, int status, char *rsp_content, gint64 rsp_size)
 {
-    task->error = http_error_to_http_task_error (status);
+    task->error = http_error_to_http_task_error (status, rsp_content, rsp_size);
 }
 
 static int
@@ -1280,7 +1303,7 @@ check_protocol_version_thread (void *vdata)
     } else {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
         data->not_supported = TRUE;
-        data->error_code = http_error_to_http_task_error (status);
+        data->error_code = http_error_to_http_task_error (status, NULL, 0);
     }
 
 out:
@@ -1437,7 +1460,7 @@ check_head_commit_thread (void *vdata)
         data->success = TRUE;
     } else {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
-        data->error_code = http_error_to_http_task_error (status);
+        data->error_code = http_error_to_http_task_error (status, NULL, 0);
     }
 
 out:
@@ -2443,9 +2466,8 @@ check_permission (HttpTxTask *task, Connection *conn)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
-        handle_http_errors (task, status);
-
-        if (status == HTTP_FORBIDDEN && rsp_content)
+        handle_http_errors (task, status, rsp_content, rsp_size);
+        if (task->error ==  HTTP_TASK_ERR_FORBIDDEN)
             notify_sync_perm_error (task, rsp_content, rsp_size);
 
         ret = -1;
@@ -2682,7 +2704,7 @@ check_quota (HttpTxTask *task, Connection *conn, gint64 delta)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
     }
 
@@ -2733,7 +2755,7 @@ send_commit_object (HttpTxTask *task, Connection *conn)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for PUT %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
     }
 
@@ -2928,7 +2950,7 @@ upload_check_id_list_segment (HttpTxTask *task, Connection *conn, const char *ur
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for POST %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
         goto out;
     }
@@ -3053,7 +3075,7 @@ send_fs_objects (HttpTxTask *task, Connection *conn, GList **send_fs_list)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for POST %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
     }
 
@@ -3348,7 +3370,7 @@ send_block (HttpTxTask *task, Connection *conn, const char *block_id, guint32 *p
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for PUT %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
         goto out;
     }
@@ -3527,6 +3549,7 @@ update_branch (HttpTxTask *task, Connection *conn)
     char *url;
     int status;
     char *rsp_content;
+    char *rsp_content_str = NULL;
     gint64 rsp_size;
     int ret = 0;
 
@@ -3552,12 +3575,15 @@ update_branch (HttpTxTask *task, Connection *conn)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for PUT %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
 
         if (status == HTTP_FORBIDDEN) {
             rsp_content[rsp_size] = '\0';
-            seaf_warning ("%s\n", rsp_content);
-            notify_permission_error (task, rsp_content);
+            rsp_content_str = g_malloc (rsp_size + 1);
+            memset (rsp_content_str, 0, rsp_size + 1);
+            memcpy (rsp_content_str, rsp_content, rsp_size);
+            seaf_warning ("%s\n", rsp_content_str);
+            notify_permission_error (task, rsp_content_str);
         }
 
         ret = -1;
@@ -3566,6 +3592,7 @@ update_branch (HttpTxTask *task, Connection *conn)
 out:
     g_free (url);
     g_free (rsp_content);
+    g_free (rsp_content_str);
     curl_easy_reset (curl);
 
     return ret;
@@ -3923,7 +3950,7 @@ get_commit_object (HttpTxTask *task, Connection *conn)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
         goto out;
     }
@@ -4000,7 +4027,7 @@ get_needed_fs_id_list (HttpTxTask *task, Connection *conn, GList **fs_id_list)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
         goto out;
     }
@@ -4139,7 +4166,7 @@ get_fs_objects (HttpTxTask *task, Connection *conn, GList **fs_list)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for POST %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
         goto out;
     }
@@ -4314,7 +4341,7 @@ get_block (HttpTxTask *task, Connection *conn, const char *block_id)
 
     if (status != HTTP_OK) {
         seaf_warning ("Bad response code for GET %s: %d.\n", url, status);
-        handle_http_errors (task, status);
+        handle_http_errors (task, status, NULL, 0);
         ret = -1;
         goto error;
     }
